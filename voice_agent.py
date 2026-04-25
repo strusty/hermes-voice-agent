@@ -337,38 +337,44 @@ class VoiceAgent:
                 return output.strip() or "(command completed, no output)"
             
             elif name == 'web_search':
-                script = f"""
-from hermes_tools import web_search
-result = web_search(query='{args['query'].replace("'", "\\'")}', limit=3)
-for r in result.get('data', {{}}).get('web', [])[:3]:
-    print(f"{{r['title']}}: {{r['description']}}")
-"""
-                result = subprocess.run(
-                    [sys.executable, '-c', script],
-                    capture_output=True, text=True, timeout=30,
-                    env={**os.environ, 'VIRTUAL_ENV': str(Path.home() / '.hermes' / 'venv'),
-                         'PATH': str(Path.home() / '.hermes' / 'venv' / 'bin') + ':' + os.environ.get('PATH', '')}
-                )
-                return result.stdout.strip() or "(no search results)"
+                # Use the Hermes API server for web search
+                api_key = os.environ.get('HERMES_API_KEY', 'test-key')
+                url = f"http://localhost:9119/api/web_search"
+                body = json.dumps({"query": args.get('query', ''), "api_key": api_key, "limit": 3})
+                try:
+                    with urllib.request.urlopen(
+                        urllib.request.Request(url, data=body.encode(), headers={'Content-Type': 'application/json'}),
+                        timeout=15
+                    ) as resp:
+                        data = json.loads(resp.read().decode())
+                        results = data.get('results', [])
+                        summary = ""
+                        for r in results[:3]:
+                            summary += f"{r.get('title', '')}: {r.get('description', '')}\n"
+                        return summary.strip() or "(no results)"
+                except Exception as e:
+                    # Fallback to wttr.in-style search via curl
+                    query = args.get('query', '').replace(' ', '+')
+                    result = subprocess.run(
+                        f"curl -s 'https://html.duckduckgo.com/html/?q={query}' | head -c 1000",
+                        shell=True, capture_output=True, text=True, timeout=15
+                    )
+                    return result.stdout[:500].strip() or f"Searched for: {args.get('query', '')}"
             
             elif name == 'web_extract':
-                urls = ', '.join(f"'{u}'" for u in args.get('urls', [])[:3])
-                script = f"""
-from hermes_tools import web_extract
-results = web_extract(urls=[{urls}])
-for r in results.get('results', [])[:3]:
-    title = r.get('title', '')
-    content = r.get('content', '')[:400]
-    if title:
-        print(f"{{title}}: {{content}}")
-"""
-                result = subprocess.run(
-                    [sys.executable, '-c', script],
-                    capture_output=True, text=True, timeout=30,
-                    env={**os.environ, 'VIRTUAL_ENV': str(Path.home() / '.hermes' / 'venv'),
-                         'PATH': str(Path.home() / '.hermes' / 'venv' / 'bin') + ':' + os.environ.get('PATH', '')}
-                )
-                return result.stdout.strip() or "(no content extracted)"
+                for url in args.get('urls', [])[:3]:
+                    try:
+                        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                        with urllib.request.urlopen(req, timeout=15) as resp:
+                            content = resp.read().decode('utf-8', errors='ignore')[:1000]
+                            # Strip HTML tags
+                            import re
+                            content = re.sub(r'<[^>]+>', ' ', content)
+                            content = ' '.join(content.split())[:500]
+                            return content.strip()
+                    except Exception as e:
+                        pass
+                return "(could not extract content)"
             
             elif name == 'send_message':
                 platform = args.get('platform', 'telegram')
