@@ -26,7 +26,7 @@ rms_threshold: 0.03             # Detection threshold (after gain)
 min_speech_chunks: 1            # Chunks above threshold to trigger (1 = fire on single spike)
 
 # Transcription
-whisper_model: "medium"         # "base", "small", "medium" — medium recommended for wake word accuracy
+whisper_model: "large-v3-turbo"         # "medium", "large-v3-turbo" — turbo recommended for best quality/speed
 whisper_threads: 4              # CPU threads for Whisper
 sliding_window: 4               # Seconds of audio buffer before triggering
 sliding_step: 2                 # Transcribe every N * chunk_duration seconds

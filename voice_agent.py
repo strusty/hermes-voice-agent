@@ -36,7 +36,7 @@ MIN_SPEECH_CHUNKS = 1  # Fire on a single spike - "Hermia" is short
 MAX_MEMORY_TURNS = 10
 
 CONVERSATION_TIMEOUT = 20
-WHISPER_MODEL_NAME = "medium"
+WHISPER_MODEL_NAME = "large-v3-turbo"
 WHISPER_THREADS = 4
 
 # Voice input → small model first, fallback to big model
