@@ -2,6 +2,27 @@
 
 Standalone, always-on voice assistant with wake word detection. Runs as a systemd service with ambient listening, local STT, and direct LLM inference.
 
+## Changelog
+
+### v14 — Apr 25, 2026 (Anti-Hallucination + Cooldown)
+- **Whisper anti-hallucination:** Added `vad_filter=True`, `no_speech_threshold=0.3`, `condition_on_previous_text=False`, `temperature=0`, `compression_ratio_threshold=2.4`, `log_prob_threshold=-1.0`
+- **Garbage filtering:** Transcriptions <3 chars or pure punctuation now silently discarded
+- **Post-response cooldown:** 8-second silence after responding — prevents "thank you Hermia" from triggering a new wake cycle
+- **Fix:** Double responses when saying thank you with wake word included
+- **Fix:** "Iteration budget exhausted (60/60)" warning from Whisper decoding silence
+
+### v13 — Apr 25, 2026
+- Reverted to single big model (Qwen3.6-27B) — small model produced hallucinated answers
+- Fixed reasoning model integration: `max_tokens=1024`, extract answer from `reasoning_content`
+- Increased `SLIDING_WINDOW` to 4s, `SLIDING_STEP` to 2s
+- Added conversation-mode ambient noise filter (requires 1.5x threshold)
+
+### v12-v11 — Apr 25, 2026
+- RMS VAD with 6x gain, threshold 0.03
+- Whisper medium model, int8 quantization
+- Mic mute during TTS to prevent feedback loop
+- Systemd services: `Restart=no`, `After=llama-voice.service`
+
 ## Difference from Hermes Agent built-in Voice Mode
 
 | Feature | Built-in Voice Mode | This Agent |
@@ -79,6 +100,24 @@ sliding_step: 2                    # Transcribe every N*chunk seconds
 ```yaml
 whisper_model: "medium"            # "base", "small", "medium"
 whisper_threads: 4                 # CPU threads for transcription
+```
+
+**Anti-hallucination parameters** (baked into `voice_agent.py`):
+The agent uses these faster-whisper parameters to prevent hallucinating text from silence:
+- `vad_filter=True` — Built-in Silero VAD pre-filters non-speech segments
+- `no_speech_threshold=0.3` — Aggressive silence detection (lower = more aggressive)
+- `condition_on_previous_text=False` — Prevents cascading hallucination loops
+- `temperature=0` — Deterministic decoding (no random hallucinated words)
+- `compression_ratio_threshold=2.4` — Catches repetitive garbage text
+- `log_prob_threshold=-1.0` — Filters low-confidence transcriptions
+
+Transcriptions under 3 characters or pure punctuation are silently discarded.
+
+### Post-Response Cooldown
+```yaml
+# Prevents "thank you Hermia" from triggering a new wake cycle
+# After responding, agent ignores transcription for 8 seconds
+# (built into voice_agent.py, not configurable via YAML yet)
 ```
 
 ### LLM

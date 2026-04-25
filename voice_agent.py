@@ -1,100 +1,64 @@
 #!/usr/bin/env python3
 """
-Hermes Voice Agent — Standalone always-on voice assistant with wake word detection.
+Hermes Voice Agent v14 — Natural multi-turn conversation with batch TTS.
+Uses dedicated voice model (Qwen2.5-1.5B) on port 8082 for instant responses.
 
-Unlike the built-in Hermes Agent voice mode (which requires gateway integration),
-this runs as a standalone systemd service with ambient wake word listening.
-
-Configuration: voice_agent_config.yaml
+Flow:
+  IDLE → "Hermia, how's the weather?" → Respond immediately to "how's the weather"
+  CONVERSATION → "Well, how do you feel?" → Respond
+  (12s silence) → IDLE
 """
 
-import subprocess, os, sys, time, json, wave, struct, threading, math, random, re
+import subprocess, os, sys, time, json, wave, struct, threading, math
 from pathlib import Path
 
-# Load configuration
-import yaml
-config_path = Path(__file__).parent / "voice_agent_config.yaml"
-if config_path.exists():
-    with open(config_path) as f:
-        cfg = yaml.safe_load(f)
-else:
-    cfg = {}
+WAKE_WORD = "hermia"
+WAKE_WORD_VARIANTS = ["hermia", "hermiya", "hermiah", "hernia", "permia", "hermia", "hermia"]
+MIC_DEVICE = "plughw:2,0"
+CHUNK_DURATION = 3
+SLIDING_WINDOW = 4  # 12s buffer - wait before firing
+SLIDING_STEP = 2     # transcribe every 6s
+LOG_FILE = Path.home() / ".hermes" / "logs" / "voice-agent.log"
+STATE_FILE = Path.home() / ".hermes" / "voice-agent.state"
+COOLDOWN = 15  # Prevent double-triggering from wake word
+POST_RESPONSE_COOLDOWN = 8  # Don't transcribe for 8s after responding (lets user finish, prevents "thank you Hermia" re-trigger)
+RECORDING_DIR = Path.home() / ".hermes" / "voice-recordings"
+CONV_FILE = Path.home() / ".hermes" / "voice-conversations.log"
+MEMORY_FILE = Path.home() / ".hermes" / "voice-memory.json"
 
-# Identity
-ASSISTANT_NAME = cfg.get('assistant_name', 'Assistant')
-OWNER_NAME = cfg.get('owner_name', 'User')
-WAKE_WORD = cfg.get('wake_word', 'assistant')
-WAKE_WORD_VARIANTS = cfg.get('wake_word_variants', [WAKE_WORD])
+# RMS levels: calibrated Apr 25
+# Silence: ~0.002 | Voice: ~0.0024-0.012
+# USB mic software gain: 4x
+# After gain: silence ~0.008, voice ~0.010-0.048
+MIN_RMS_ENERGY = 0.03
+RMS_GAIN = 6
+MIN_SPEECH_CHUNKS = 1  # Fire on a single spike - "Hermia" is short
+MAX_MEMORY_TURNS = 10
 
-# Audio
-MIC_DEVICE = cfg.get('mic_device', 'default')
-SPEAKER_DEVICE = cfg.get('speaker_device', 'default')
-TTS_VOICE = cfg.get('tts_voice', 'en-US-MichelleNeural')
+CONVERSATION_TIMEOUT = 20
+WHISPER_MODEL_NAME = "medium"
+WHISPER_THREADS = 4
 
-# RMS detection
-RMS_GAIN = cfg.get('rms_gain', 6)
-MIN_RMS_ENERGY = cfg.get('rms_threshold', 0.03)
-MIN_SPEECH_CHUNKS = cfg.get('min_speech_chunks', 1)
-
-# Transcription
-WHISPER_MODEL_NAME = cfg.get('whisper_model', 'medium')
-WHISPER_THREADS = cfg.get('whisper_threads', 4)
-CHUNK_DURATION = cfg.get('chunk_duration', 3)
-SLIDING_WINDOW = cfg.get('sliding_window', 4)
-SLIDING_STEP = cfg.get('sliding_step', 2)
-
-# Conversation
-CONVERSATION_TIMEOUT = cfg.get('conversation_timeout', 20)
-COOLDOWN = cfg.get('cooldown', 15)
-MAX_MEMORY_TURNS = cfg.get('max_memory_turns', 10)
-
-# LLM
-API_URL = cfg.get('llm_url', 'http://localhost:8080/v1/chat/completions')
-LLM_MAX_TOKENS = cfg.get('llm_max_tokens', 2048)
-LLM_TEMPERATURE = cfg.get('llm_temperature', 0.8)
-LLM_TIMEOUT = cfg.get('llm_timeout', 120)
-IS_REASONING_MODEL = cfg.get('is_reasoning_model', False)
-
-# Paths
-LOG_FILE = Path(cfg.get('log_file', '~/.hermes/logs/voice-agent.log').expanduser())
-STATE_FILE = Path(cfg.get('state_file', '~/.hermes/voice-agent.state').expanduser())
-MEMORY_FILE = Path(cfg.get('memory_file', '~/.hermes/voice-memory.json').expanduser())
-CONV_FILE = Path(cfg.get('conversation_log', '~/.hermes/voice-conversations.log').expanduser())
-RECORDING_DIR = Path(cfg.get('recording_dir', '~/.hermes/voice-recordings').expanduser())
-
-# System prompt
-SYSTEM_PROMPT = cfg.get('system_prompt', f'You are {ASSISTANT_NAME}, a warm AI voice assistant.').format(
-    name=ASSISTANT_NAME, owner=OWNER_NAME
-)
-
-# Phrases
-FALLBACK_PHRASES = cfg.get('fallback_phrases', [
-    "That's a good question, let me think about that for a moment.",
-    "Interesting question, give me a moment to reflect on that.",
-])
-
-GREETING_RESPONSES = cfg.get('greeting_responses', [
-    f"Yes, {OWNER_NAME}. How can I help you?",
-    "Yes, what's on your mind?",
-    "I'm here. What do you need?",
-])
+# Voice input → small model first, fallback to big model
+API_URL_SMALL = "http://localhost:8082/v1/chat/completions"
+API_URL_BIG   = "http://localhost:8080/v1/chat/completions"
+TTS_VOICE = "en-US-MichelleNeural"
 
 
 class VoiceAgent:
     def __init__(self):
         self.running = True
         self.last_wake_time = 0
+        self.last_response_time = 0  # Track when we last finished responding
         self.whisper_model = None
         self.lock = threading.Lock()
         self.memory = []
         self.conversation_active = False
         self.last_speech_time = time.time()
         RECORDING_DIR.mkdir(parents=True, exist_ok=True)
-        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-        self.log(f"Voice Agent v2.0 — Whisper '{WHISPER_MODEL_NAME}' ({WHISPER_THREADS} threads, int8)")
-        self.log(f"Wake word: '{WAKE_WORD}' ({len(WAKE_WORD_VARIANTS)} variants)")
-        self.log(f"RMS threshold: {MIN_RMS_ENERGY} | Gain: {RMS_GAIN}x | Mic: {MIC_DEVICE}")
+        self.log("Hermes Voice Agent v14 — whisper base (4 threads, int8) + dedicated voice model (port 8082)")
+        self.log(f"RMS threshold: {MIN_RMS_ENERGY} | Mic: {MIC_DEVICE}")
 
         self._load_memory()
         self._load_whisper()
@@ -133,10 +97,21 @@ class VoiceAgent:
         if self.memory:
             history = "Recent conversation:\n"
             for t in self.memory[-MAX_MEMORY_TURNS:]:
-                history += f"User: {t['user']}\nAssistant: {t['assistant']}\n"
+                history += f"User: {t['user']}\nAssistant: {t['hermes']}\n"
         return [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"{history}User: {user_text}"},
+            {
+                "role": "system",
+                "content": "You are Hermia, a warm AI voice assistant and Stuart's AI companion. "
+                "You are NOT Shakespeare's character from A Midsummer Night's Dream. "
+                "Keep responses brief (1-2 sentences). Be warm and direct. "
+                "No markdown. Speak naturally. "
+                "Do NOT start your response with 'Hermia:' or your own name. "
+                "Just answer directly."
+            },
+            {
+                "role": "user",
+                "content": f"{history}User: {user_text}"
+            },
         ]
 
     def log(self, msg):
@@ -181,11 +156,15 @@ class VoiceAgent:
 
     def concat_wavs(self, paths, out):
         frames = b''
-        ch, sw, rate = 2, 2, 44100
+        ch = 2
+        sw = 2
+        rate = 44100
         for p in paths:
             try:
                 with wave.open(p, 'rb') as wf:
-                    ch, sw, rate = wf.getnchannels(), wf.getsampwidth(), wf.getframerate()
+                    ch = wf.getnchannels()
+                    sw = wf.getsampwidth()
+                    rate = wf.getframerate()
                     frames += wf.readframes(wf.getnframes())
             except:
                 continue
@@ -203,11 +182,26 @@ class VoiceAgent:
             return ""
         try:
             with self.lock:
-                kw = {'language': 'en', 'beam_size': 5, 'word_timestamps': True}
+                kw = {
+                    'language': 'en',
+                    'beam_size': 5,
+                    'word_timestamps': True,
+                    # Anti-hallucination parameters:
+                    'vad_filter': True,                        # Built-in Silero VAD pre-filters non-speech
+                    'no_speech_threshold': 0.3,                # More aggressive silence detection (default 0.6)
+                    'condition_on_previous_text': False,       # Prevents cascading hallucination loops
+                    'temperature': 0,                          # Deterministic decoding, less random hallucination
+                    'compression_ratio_threshold': 2.4,        # Detects repetitive/hallucinated text
+                    'log_prob_threshold': -1.0,               # Filters low-confidence transcriptions
+                }
                 if prompt:
                     kw['initial_prompt'] = prompt
                 segs, _ = self.whisper_model.transcribe(path, **kw)
-            return ' '.join(s.text for s in segs).strip()
+                text = ' '.join(s.text for s in segs).strip()
+            # Extra safety: if transcription is all spaces/short garbage, treat as silence
+            if len(text) < 3 or all(c.isspace() or c in '.,!?\'-' for c in text):
+                return ""
+            return text
         except Exception as e:
             self.log(f"Transcribe error: {e}")
             return ""
@@ -244,10 +238,9 @@ class VoiceAgent:
                 return
             self.log(f"TTS wav: {wav.stat().st_size} bytes")
 
-            # Mute mic during playback to prevent feedback
             subprocess.run(['amixer', 'sset', 'Capture', '0%'], capture_output=True)
             self.log("Mic muted during TTS")
-            result = subprocess.run(['aplay', '-D', SPEAKER_DEVICE, str(wav)], capture_output=True, timeout=30)
+            result = subprocess.run(['aplay', '-D', 'plughw:1,2', str(wav)], capture_output=True, timeout=30)
             if result.returncode != 0:
                 self.log(f"aplay failed: {result.stderr.decode()[:100]}")
 
@@ -258,32 +251,33 @@ class VoiceAgent:
             subprocess.run(['amixer', 'sset', 'Capture', '100%'], capture_output=True)
             self.log(f"TTS error: {e}")
 
-    def _call_model(self, user_text, timeout=LLM_TIMEOUT, max_tokens=LLM_MAX_TOKENS):
+    def _call_model(self, user_text, url, timeout=120, max_tokens=2048):
         messages = self._build_context(user_text)
         body = json.dumps({
             "model": "voice",
             "messages": messages,
             "max_tokens": max_tokens,
-            "temperature": LLM_TEMPERATURE,
+            "temperature": 0.8,
         }).encode()
         headers = {'Content-Type': 'application/json'}
         try:
             import urllib.request
             with urllib.request.urlopen(
-                urllib.request.Request(API_URL, data=body, headers=headers), timeout=timeout
+                urllib.request.Request(url, data=body, headers=headers), timeout=timeout
             ) as resp:
                 data = json.loads(resp.read().decode())
                 content = data['choices'][0]['message']['content'].strip()
-                # Handle reasoning models (empty content, answer in reasoning_content)
-                if IS_REASONING_MODEL and not content:
+                # Qwen3.6-27B is a reasoning model - extract answer from reasoning if content is empty
+                if not content:
                     reasoning = data['choices'][0]['message'].get('reasoning_content', '').strip()
                     if reasoning:
                         # Extract the actual response from reasoning (look for quoted text)
+                        import re
                         quoted = re.findall(r'"([^"]{15,200})"', reasoning)
                         if quoted:
                             content = quoted[-1]  # Take last quoted sentence
                         else:
-                            # Fallback: take last meaningful line
+                            # Fallback: take last meaningful sentence
                             lines = [l.strip() for l in reasoning.split('\n') if l.strip() and len(l.strip()) > 20]
                             content = lines[-1] if lines else reasoning
                         # Clean up artifacts
@@ -292,7 +286,7 @@ class VoiceAgent:
                         content = ' '.join(content.split())[:200].strip()
                 return content
         except Exception as e:
-            self.log(f"API error: {e}")
+            self.log(f"API error ({url}): {e}")
             return None
 
     def _is_refusal(self, text):
@@ -308,35 +302,46 @@ class VoiceAgent:
         ]
         return any(r in lower for r in refusals) or len(text) < 15
 
+    FALLBACK_PHRASES = [
+        "That's a good question, let me think about that for a moment.",
+        "Interesting question, give me a moment to reflect on that.",
+        "That'll take me just a moment, let me consider that carefully.",
+        "Let me give that some thought for a moment.",
+    ]
+
+    GREETING_RESPONSES = [
+        "Yes, Stuart. How can I help you?",
+        "Yes, what's on your mind?",
+        "I'm here. What do you need?",
+    ]
+
     def get_response(self, user_text):
         # Handle bare wake word with no question
         if user_text.lower().strip() in WAKE_WORD_VARIANTS:
-            greeting = random.choice(GREETING_RESPONSES)
+            import random
+            greeting = random.choice(self.GREETING_RESPONSES)
             self.log(f"GREETING: {greeting}")
             self.speak(greeting)
-            self.memory.append({'user': user_text, 'assistant': greeting, 'time': time.time()})
+            self.memory.append({'user': user_text, 'hermes': greeting, 'time': time.time()})
             self._save_memory()
             return greeting
 
-        # Speak transition phrase while waiting for LLM
-        phrase = random.choice(FALLBACK_PHRASES)
+        # Always use big model for quality — speak transition first
+        import random
+        phrase = random.choice(self.FALLBACK_PHRASES)
         self.log(f"Transition: {phrase}")
         self.speak(phrase)
-        
-        # Call LLM
-        full = self._call_model(user_text)
+        full = self._call_model(user_text, API_URL_BIG, timeout=90)
         if not full:
             full = "I had trouble thinking about that one."
-        self.log("LLM responded")
+        self.log("Big model responded")
 
-        # Clean response
         full = full.replace('*', '').replace('#', '').replace('`', '').replace('~~', '').strip()
-        # Strip assistant name prefix if model adds it
-        for prefix in [f"{ASSISTANT_NAME.lower()}:", f"{ASSISTANT_NAME.lower()} ", "assistant:", "assistant "]:
+        # Strip "Hermia:" or "Assistant:" prefix if model adds it
+        for prefix in ["hermia:", "hermia ", "hermiya:", "hernia:", "assistant:", "assistant "]:
             if full.lower().startswith(prefix):
                 full = full[len(prefix):].strip()
-        
-        self.memory.append({'user': user_text, 'assistant': full[:200], 'time': time.time()})
+        self.memory.append({'user': user_text, 'hermes': full[:200], 'time': time.time()})
         if len(self.memory) > MAX_MEMORY_TURNS * 2:
             self.memory = self.memory[-MAX_MEMORY_TURNS:]
         self._save_memory()
@@ -354,13 +359,14 @@ class VoiceAgent:
     def log_conv(self, u, r):
         try:
             with open(CONV_FILE, 'a') as f:
-                f.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}]\nYou: {u}\n{ASSISTANT_NAME}: {r}\n")
+                f.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}]\nYou: {u}\nHermia: {r}\n")
         except:
             pass
 
     def process_speech(self, text):
         self.save_state("thinking")
         resp = self.get_response(text)
+        self.last_response_time = time.time()  # Stamp end of response for cooldown
         self.save_state("speaking")
         self.log_conv(text, resp)
         self.last_speech_time = time.time()
@@ -390,17 +396,22 @@ class VoiceAgent:
 
                     speech_count = sum(1 for _, x in buf if x > MIN_RMS_ENERGY)
                     if speech_count >= MIN_SPEECH_CHUNKS and len(buf) >= SLIDING_WINDOW:
-                        # During conversation, require louder speech to avoid ambient noise
+                        # During conversation, require louder speech to avoid hallucinating ambient noise
                         if self.conversation_active:
                             loud_count = sum(1 for _, x in buf if x > MIN_RMS_ENERGY * 1.5)
                             if loud_count < 2:
                                 continue  # Probably ambient noise, skip
+                        # Post-response cooldown: don't transcribe immediately after responding
+                        # Prevents "thank you Hermia" from triggering a new wake cycle
+                        post_cd = time.time() - self.last_response_time
+                        if post_cd < POST_RESPONSE_COOLDOWN:
+                            continue  # Still cooling down from last response
                         counter += 1
                         if counter >= SLIDING_STEP:
                             counter = 0
                             sp = RECORDING_DIR / f"seg_{time.time()}.wav"
                             if self.concat_wavs([p for p, _ in buf], str(sp)):
-                                prompt = WAKE_WORD if not self.conversation_active else None
+                                prompt = "hermia" if not self.conversation_active else None
                                 text = self.transcribe(str(sp), prompt=prompt)
                                 if text:
                                     self.log(f"EAR '{text}'")
@@ -415,7 +426,7 @@ class VoiceAgent:
                                             self.log(f"WAKE Command: '{command}'")
                                             self.process_speech(command)
                                         elif self.conversation_active:
-                                            # Wake word during cooldown, but already in conversation
+                                            # Wake word during cooldown, but already in conversation — treat as follow-up
                                             self.log(f"CHAT (cooldown) Response to: '{text}'")
                                             self.process_speech(text)
                                         else:
