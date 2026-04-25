@@ -338,34 +338,35 @@ class VoiceAgent:
                     output += "\n" + result.stderr[:200]
                 return output.strip() or "(command completed, no output)"
             
-            elif name == 'web_search':
+        elif name == 'web_search':
                 query = args.get('query', '')
-                # Try wttr.in for weather queries
-                weather_match = re.match(r'weather\s+(.*)', query, re.IGNORECASE)
-                if weather_match:
-                    location = weather_match.group(1).replace(' ', '%20')
+                # Use Brave Search API
+                api_key = os.environ.get('BRAVE_API_KEY', '')
+                if api_key:
+                    url = f"https://api.search.brave.com/res/v1/web/search?q={urllib.parse.quote(query)}&count=3"
+                    req = urllib.request.Request(url, headers={'Accept': 'application/json', 'X-Subscription-Token': api_key})
                     try:
-                        with urllib.request.urlopen(
-                            f'https://wttr.in/{location}?format=3+%C+%T+%w', timeout=10
-                        ) as resp:
-                            return f"Weather in {weather_match.group(1)}: {resp.read().decode().strip()}"
-                    except:
-                        pass
-                
-                # For general queries, try Google via curl (simple extraction)
-                query_encoded = query.replace(' ', '+')
-                try:
-                    result = subprocess.run(
-                        f"curl -sL 'https://www.google.com/search?q={query_encoded}' -H 'User-Agent: Mozilla/5.0' | sed -n '/<h3/,/<\\/h3>/p' | head -c 500",
-                        shell=True, capture_output=True, text=True, timeout=10
-                    )
-                    output = result.stdout[:300].strip()
-                    if output:
-                        return output
-                except:
-                    pass
-                
-                return f"Search results for: {query}"
+                        with urllib.request.urlopen(req, timeout=15) as resp:
+                            data = json.loads(resp.read().decode())
+                            summary = ""
+                            for r in data.get('web', {}).get('results', [])[:3]:
+                                summary += f"{r.get('title', '')}: {r.get('description', '')}\n"
+                            return summary.strip() or "(no results)"
+                    except Exception as e:
+                        return f"Search error: {e}"
+                else:
+                    # Fallback: wttr.in for weather
+                    weather_match = re.match(r'weather\\s+(.*)', query, re.IGNORECASE)
+                    if weather_match:
+                        location = weather_match.group(1).replace(' ', '%20')
+                        try:
+                            with urllib.request.urlopen(
+                                f'https://wttr.in/{location}?format=3+%C+%T+%w', timeout=10
+                            ) as resp:
+                                return f"Weather in {weather_match.group(1)}: {resp.read().decode().strip()}"
+                        except:
+                            pass
+                    return f"(BRAVE_API_KEY not configured, searched for: {query})"
             
             elif name == 'web_extract':
                 for url in args.get('urls', [])[:3]:
