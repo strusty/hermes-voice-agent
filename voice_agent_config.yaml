@@ -1,0 +1,77 @@
+# Hermes Voice Agent Configuration
+# Edit these values to customize your voice assistant
+
+# Identity
+assistant_name: "Hermia"
+owner_name: "Stuart"
+wake_word: "hermia"
+
+# Wake word variants the agent will recognize
+# Include phonetic approximations (e.g., "permia" if Whisper misspells it)
+wake_word_variants:
+  - "hermia"
+  - "hermiya"
+  - "hermiah"
+  - "hernia"
+  - "permia"
+
+# Audio devices
+mic_device: "plughw:2,0"       # USB mic
+speaker_device: "plughw:1,2"   # Audio output
+
+# RMS voice activity detection
+# Tune these based on your mic's noise floor
+rms_gain: 6                     # Software gain multiplier
+rms_threshold: 0.03             # Detection threshold (after gain)
+min_speech_chunks: 1            # Chunks above threshold to trigger (1 = fire on single spike)
+
+# Transcription
+whisper_model: "medium"         # "base", "small", "medium" — medium recommended for wake word accuracy
+whisper_threads: 4              # CPU threads for Whisper
+sliding_window: 4               # Seconds of audio buffer before triggering
+sliding_step: 2                 # Transcribe every N * chunk_duration seconds
+chunk_duration: 3               # Each audio chunk in seconds
+
+# Conversation
+conversation_timeout: 20        # Seconds of silence before conversation ends
+cooldown: 15                    # Seconds between wake word triggers
+max_memory_turns: 10            # Conversation history length
+
+# LLM
+llm_url: "http://localhost:8080/v1/chat/completions"
+llm_max_tokens: 2048            # Increase if model needs room for reasoning
+llm_temperature: 0.8
+llm_timeout: 120                # Seconds to wait for response
+is_reasoning_model: true        # Extract answer from reasoning_content if content is empty
+
+# TTS
+tts_voice: "en-US-MichelleNeural"  # Edge TTS voice
+
+# System prompt customization
+# {name} and {owner} are replaced with assistant_name and owner_name
+system_prompt: |
+  You are {name}, a warm AI voice assistant and {owner}'s AI companion.
+  Keep responses brief (1-2 sentences). Be warm and direct.
+  No markdown. Speak naturally.
+  Do NOT start your response with '{name}:' or your own name.
+  Just answer directly.
+
+# Fallback phrases spoken while waiting for LLM response
+fallback_phrases:
+  - "That's a good question, let me think about that for a moment."
+  - "Interesting question, give me a moment to reflect on that."
+  - "That'll take me just a moment, let me consider that carefully."
+  - "Let me give that some thought for a moment."
+
+# Greeting responses for bare wake word (no question)
+greeting_responses:
+  - "Yes, {owner}. How can I help you?"
+  - "Yes, what's on your mind?"
+  - "I'm here. What do you need?"
+
+# Paths
+log_file: "~/.hermes/logs/voice-agent.log"
+state_file: "~/.hermes/voice-agent.state"
+memory_file: "~/.hermes/voice-memory.json"
+conversation_log: "~/.hermes/voice-conversations.log"
+recording_dir: "~/.hermes/voice-recordings"

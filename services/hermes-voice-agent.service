@@ -1,0 +1,13 @@
+[Unit]
+Description=Hermes Voice Agent
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /path/to/voice_agent.py
+Restart=no
+User=sysadmin
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
