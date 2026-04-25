@@ -98,9 +98,18 @@ sliding_step: 2                    # Transcribe every N*chunk seconds
 
 ### Whisper
 ```yaml
-whisper_model: "medium"            # "base", "small", "medium"
-whisper_threads: 4                 # CPU threads for transcription
+whisper_model: "large-v3-turbo"       # "medium", "large-v3-turbo" — turbo recommended
+whisper_threads: 4                    # CPU threads for transcription
 ```
+
+**Model tiers:**
+| Model | Parameters | RAM (int8) | Speed | Accuracy |
+|-------|-----------|-----------|-------|----------|
+| `medium` | 769M | ~1.5GB | Fast | Good |
+| `large-v3-turbo` | 809M | ~2GB | Fast | Excellent (recommended) |
+| `large-v3` | 1.55B | ~3GB | Slow | Best (overkill for wake words) |
+
+**Why `large-v3-turbo`?** Only ~5% bigger than `medium`, but significantly better language understanding, far fewer hallucinations, and much better at wake words and accents. OpenAI's current recommendation for local deployment.
 
 **Anti-hallucination parameters** (baked into `voice_agent.py`):
 The agent uses these faster-whisper parameters to prevent hallucinating text from silence:
