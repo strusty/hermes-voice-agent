@@ -339,29 +339,33 @@ class VoiceAgent:
                 return output.strip() or "(command completed, no output)"
             
             elif name == 'web_search':
-                # Use the Hermes API server for web search
-                api_key = os.environ.get('HERMES_API_KEY', 'test-key')
-                url = f"http://localhost:9119/api/web_search"
-                body = json.dumps({"query": args.get('query', ''), "api_key": api_key, "limit": 3})
+                query = args.get('query', '')
+                # Try wttr.in for weather queries
+                weather_match = re.match(r'weather\s+(.*)', query, re.IGNORECASE)
+                if weather_match:
+                    location = weather_match.group(1).replace(' ', '%20')
+                    try:
+                        with urllib.request.urlopen(
+                            f'https://wttr.in/{location}?format=3+%C+%T+%w', timeout=10
+                        ) as resp:
+                            return f"Weather in {weather_match.group(1)}: {resp.read().decode().strip()}"
+                    except:
+                        pass
+                
+                # For general queries, try Google via curl (simple extraction)
+                query_encoded = query.replace(' ', '+')
                 try:
-                    with urllib.request.urlopen(
-                        urllib.request.Request(url, data=body.encode(), headers={'Content-Type': 'application/json'}),
-                        timeout=15
-                    ) as resp:
-                        data = json.loads(resp.read().decode())
-                        results = data.get('results', [])
-                        summary = ""
-                        for r in results[:3]:
-                            summary += f"{r.get('title', '')}: {r.get('description', '')}\n"
-                        return summary.strip() or "(no results)"
-                except Exception as e:
-                    # Fallback to wttr.in-style search via curl
-                    query = args.get('query', '').replace(' ', '+')
                     result = subprocess.run(
-                        f"curl -s 'https://html.duckduckgo.com/html/?q={query}' | head -c 1000",
-                        shell=True, capture_output=True, text=True, timeout=15
+                        f"curl -sL 'https://www.google.com/search?q={query_encoded}' -H 'User-Agent: Mozilla/5.0' | sed -n '/<h3/,/<\\/h3>/p' | head -c 500",
+                        shell=True, capture_output=True, text=True, timeout=10
                     )
-                    return result.stdout[:500].strip() or f"Searched for: {args.get('query', '')}"
+                    output = result.stdout[:300].strip()
+                    if output:
+                        return output
+                except:
+                    pass
+                
+                return f"Search results for: {query}"
             
             elif name == 'web_extract':
                 for url in args.get('urls', [])[:3]:
