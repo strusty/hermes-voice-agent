@@ -169,11 +169,13 @@ class VoiceAgent:
                 "content": f"You are Hermia, a warm AI voice assistant and Stuart's AI companion. "
                 f"You are NOT Shakespeare's character from A Midsummer Night's Dream. "
                 f"Current time: {now}. You are in Atlanta, Georgia. "
-                f"You have tools (terminal, web_search, web_extract, send_message) to help answer questions. "
-                f"Keep responses brief (1-2 sentences). Be warm and direct. "
-                f"No markdown. Speak naturally. "
-                f"Do NOT start your response with 'Hermia:' or your own name. "
-                f"Just answer directly."
+                f"You have these tools. To use one, start your response with TOOL:tool_name on its own line:\n"
+                f"  - TOOL:terminal - Execute a shell command (e.g., df -h, ls, uptime)\n"
+                f"  - TOOL:web_search - Search the web for information (e.g., current Bitcoin price)\n"
+                f"  - TOOL:web_extract - Extract text from a URL\n"
+                f"  - TOOL:send_message - Send a message via Telegram/Discord/WhatsApp\n"
+                f"Keep responses brief (1-2 sentences). Be warm and direct. No markdown. Speak naturally.\n"
+                f"Do NOT start your response with 'Hermia:' or your own name. Just answer directly."
             },
             {
                 "role": "user",
@@ -400,7 +402,7 @@ class VoiceAgent:
             return f"Error: {e}"
 
     def _call_model(self, user_text, url, timeout=120, max_tokens=2048):
-        """Call the LLM with tool support. Loops until we get a text response."""
+        """Call the LLM with text-based tool support. Loops until we get a text response."""
         messages = self._build_context(user_text)
         headers = {'Content-Type': 'application/json'}
         
@@ -411,7 +413,6 @@ class VoiceAgent:
                 "messages": messages,
                 "max_tokens": max_tokens,
                 "temperature": 0.8,
-                "tools": VOICE_TOOLS,
             }).encode()
             
             try:
@@ -421,20 +422,44 @@ class VoiceAgent:
                     data = json.loads(resp.read().decode())
                     msg = data['choices'][0]['message']
                     content = msg.get('content', '').strip()
-                    tool_calls = msg.get('tool_calls', [])
                     
-                    if tool_calls:
-                        self.log(f"Tool calls: {[tc['function']['name'] for tc in tool_calls]}")
-                        for tc in tool_calls:
-                            result = self._execute_tool(tc)
-                            messages.append({
-                                "role": "tool",
-                                "tool_call_id": tc.get('id', 'call_1'),
-                                "content": result
-                            })
+                    # Check for tool usage: TOOL:tool_name on first line
+                    tool_match = re.match(r'^TOOL:(\w+)\s*(.*)', content, re.DOTALL)
+                    if tool_match:
+                        tool_name = tool_match.group(1)
+                        tool_args_str = tool_match.group(2).strip()
+                        
+                        # Parse tool arguments from the rest of the response
+                        tool_args = {}
+                        try:
+                            tool_args = json.loads(tool_args_str)
+                        except:
+                            # Try to extract from natural language
+                            self.log(f"TOOL: {tool_name} args: {tool_args_str[:100]}")
+                            if tool_name == 'terminal':
+                                tool_args = {'command': tool_args_str}
+                            elif tool_name == 'web_search':
+                                tool_args = {'query': tool_args_str}
+                            elif tool_name == 'send_message':
+                                # Parse platform and message from text
+                                parts = tool_args_str.split(':', 1)
+                                if len(parts) == 2:
+                                    tool_args = {'platform': parts[0].strip().lower(), 'message': parts[1].strip()}
+                                else:
+                                    tool_args = {'platform': 'telegram', 'message': tool_args_str}
+                        
+                        result = self._execute_tool({'function': {'name': tool_name, 'arguments': tool_args}})
+                        messages.append({
+                            "role": "assistant",
+                            "content": content
+                        })
+                        messages.append({
+                            "role": "user",
+                            "content": f"Tool result: {result}\nNow give me your final spoken answer based on this result."
+                        })
                         continue  # Loop back with tool results
                     
-                    # No more tool calls - extract final answer
+                    # No tool call - extract final answer
                     if not content:
                         reasoning = msg.get('reasoning_content', '').strip()
                         if reasoning:
