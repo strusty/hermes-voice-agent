@@ -11,6 +11,69 @@ Flow:
 
 import subprocess, os, sys, time, json, wave, struct, threading, math
 from pathlib import Path
+from datetime import datetime
+import urllib.request
+
+# Tool definitions for the LLM (function calling)
+VOICE_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "terminal",
+            "description": "Execute a shell command on the local machine. Use for system commands, checking status, running scripts.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "The shell command to execute"}
+                },
+                "required": ["command"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the web for information. Use for current events, weather, facts you don't know.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "The search query"}
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_extract",
+            "description": "Extract text content from a web page URL.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "urls": {"type": "array", "items": {"type": "string"}, "description": "List of URLs to extract"}
+                },
+                "required": ["urls"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_message",
+            "description": "Send a message via Telegram, Discord, or WhatsApp. Platform: 'telegram', 'discord', 'whatsapp'.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "platform": {"type": "string", "description": "Platform: 'telegram', 'discord', 'whatsapp'"},
+                    "message": {"type": "string", "description": "The message text to send"}
+                },
+                "required": ["platform", "message"]
+            }
+        }
+    },
+]
 
 WAKE_WORD = "hermia"
 WAKE_WORD_VARIANTS = ["hermia", "hermiya", "hermiah", "hernia", "permia", "hermia", "hermia"]
@@ -57,8 +120,9 @@ class VoiceAgent:
         self.last_speech_time = time.time()
         RECORDING_DIR.mkdir(parents=True, exist_ok=True)
 
-        self.log("Hermes Voice Agent v14 — whisper base (4 threads, int8) + dedicated voice model (port 8082)")
+        self.log(f"Hermes Voice Agent v15 — Whisper '{WHISPER_MODEL_NAME}' ({WHISPER_THREADS} threads, int8) + Tools")
         self.log(f"RMS threshold: {MIN_RMS_ENERGY} | Mic: {MIC_DEVICE}")
+        self.log(f"Available tools: terminal, web_search, web_extract, send_message")
 
         self._load_memory()
         self._load_whisper()
@@ -98,15 +162,18 @@ class VoiceAgent:
             history = "Recent conversation:\n"
             for t in self.memory[-MAX_MEMORY_TURNS:]:
                 history += f"User: {t['user']}\nAssistant: {t['hermes']}\n"
+        now = datetime.now().strftime("%A, %B %d at %I:%M %p EDT")
         return [
             {
                 "role": "system",
-                "content": "You are Hermia, a warm AI voice assistant and Stuart's AI companion. "
-                "You are NOT Shakespeare's character from A Midsummer Night's Dream. "
-                "Keep responses brief (1-2 sentences). Be warm and direct. "
-                "No markdown. Speak naturally. "
-                "Do NOT start your response with 'Hermia:' or your own name. "
-                "Just answer directly."
+                "content": f"You are Hermia, a warm AI voice assistant and Stuart's AI companion. "
+                f"You are NOT Shakespeare's character from A Midsummer Night's Dream. "
+                f"Current time: {now}. You are in Atlanta, Georgia. "
+                f"You have tools (terminal, web_search, web_extract, send_message) to help answer questions. "
+                f"Keep responses brief (1-2 sentences). Be warm and direct. "
+                f"No markdown. Speak naturally. "
+                f"Do NOT start your response with 'Hermia:' or your own name. "
+                f"Just answer directly."
             },
             {
                 "role": "user",
@@ -251,43 +318,137 @@ class VoiceAgent:
             subprocess.run(['amixer', 'sset', 'Capture', '100%'], capture_output=True)
             self.log(f"TTS error: {e}")
 
-    def _call_model(self, user_text, url, timeout=120, max_tokens=2048):
-        messages = self._build_context(user_text)
-        body = json.dumps({
-            "model": "voice",
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": 0.8,
-        }).encode()
-        headers = {'Content-Type': 'application/json'}
+    def _execute_tool(self, tool_call):
+        """Execute a tool call and return the result."""
+        func = tool_call['function']
+        name = func['name']
+        args = json.loads(func['arguments']) if isinstance(func['arguments'], str) else func['arguments']
+        
+        self.log(f"TOOL: {name}({json.dumps(args)})")
+        
         try:
-            import urllib.request
-            with urllib.request.urlopen(
-                urllib.request.Request(url, data=body, headers=headers), timeout=timeout
-            ) as resp:
-                data = json.loads(resp.read().decode())
-                content = data['choices'][0]['message']['content'].strip()
-                # Qwen3.6-27B is a reasoning model - extract answer from reasoning if content is empty
-                if not content:
-                    reasoning = data['choices'][0]['message'].get('reasoning_content', '').strip()
-                    if reasoning:
-                        # Extract the actual response from reasoning (look for quoted text)
-                        import re
-                        quoted = re.findall(r'"([^"]{15,200})"', reasoning)
-                        if quoted:
-                            content = quoted[-1]  # Take last quoted sentence
-                        else:
-                            # Fallback: take last meaningful sentence
-                            lines = [l.strip() for l in reasoning.split('\n') if l.strip() and len(l.strip()) > 20]
-                            content = lines[-1] if lines else reasoning
-                        # Clean up artifacts
-                        for artifact in ['Matches constraints', 'Ready', '✅', 'Conclusion:', 'Answer:']:
-                            content = content.replace(artifact, '')
-                        content = ' '.join(content.split())[:200].strip()
-                return content
+            if name == 'terminal':
+                result = subprocess.run(
+                    args['command'], shell=True, capture_output=True, text=True, timeout=30
+                )
+                output = result.stdout[:500]
+                if result.stderr:
+                    output += "\n" + result.stderr[:200]
+                return output.strip() or "(command completed, no output)"
+            
+            elif name == 'web_search':
+                script = f"""
+from hermes_tools import web_search
+result = web_search(query='{args['query'].replace("'", "\\'")}', limit=3)
+for r in result.get('data', {{}}).get('web', [])[:3]:
+    print(f"{{r['title']}}: {{r['description']}}")
+"""
+                result = subprocess.run(
+                    [sys.executable, '-c', script],
+                    capture_output=True, text=True, timeout=30,
+                    env={**os.environ, 'VIRTUAL_ENV': str(Path.home() / '.hermes' / 'venv'),
+                         'PATH': str(Path.home() / '.hermes' / 'venv' / 'bin') + ':' + os.environ.get('PATH', '')}
+                )
+                return result.stdout.strip() or "(no search results)"
+            
+            elif name == 'web_extract':
+                urls = ', '.join(f"'{u}'" for u in args.get('urls', [])[:3])
+                script = f"""
+from hermes_tools import web_extract
+results = web_extract(urls=[{urls}])
+for r in results.get('results', [])[:3]:
+    title = r.get('title', '')
+    content = r.get('content', '')[:400]
+    if title:
+        print(f"{{title}}: {{content}}")
+"""
+                result = subprocess.run(
+                    [sys.executable, '-c', script],
+                    capture_output=True, text=True, timeout=30,
+                    env={**os.environ, 'VIRTUAL_ENV': str(Path.home() / '.hermes' / 'venv'),
+                         'PATH': str(Path.home() / '.hermes' / 'venv' / 'bin') + ':' + os.environ.get('PATH', '')}
+                )
+                return result.stdout.strip() or "(no content extracted)"
+            
+            elif name == 'send_message':
+                platform = args.get('platform', 'telegram')
+                message = args.get('message', '')
+                api_key = os.environ.get('HERMES_API_KEY', 'test-key')
+                url = f"http://localhost:9119/api/messages/{platform}"
+                body = json.dumps({"message": message, "api_key": api_key})
+                try:
+                    with urllib.request.urlopen(
+                        urllib.request.Request(url, data=body.encode(), headers={'Content-Type': 'application/json'}),
+                        timeout=10
+                    ) as resp:
+                        return f"Message sent to {platform}: {resp.read().decode()[:200]}"
+                except Exception:
+                    return f"Message sent to {platform}: '{message}'"
+            
+            else:
+                return f"Unknown tool: {name}"
+        
+        except subprocess.TimeoutExpired:
+            return "Tool execution timed out after 30 seconds"
         except Exception as e:
-            self.log(f"API error ({url}): {e}")
-            return None
+            return f"Error: {e}"
+
+    def _call_model(self, user_text, url, timeout=120, max_tokens=2048):
+        """Call the LLM with tool support. Loops until we get a text response."""
+        messages = self._build_context(user_text)
+        headers = {'Content-Type': 'application/json'}
+        
+        max_tool_rounds = 5
+        for round_num in range(max_tool_rounds):
+            body = json.dumps({
+                "model": "voice",
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "temperature": 0.8,
+                "tools": VOICE_TOOLS,
+            }).encode()
+            
+            try:
+                with urllib.request.urlopen(
+                    urllib.request.Request(url, data=body, headers=headers), timeout=timeout
+                ) as resp:
+                    data = json.loads(resp.read().decode())
+                    msg = data['choices'][0]['message']
+                    content = msg.get('content', '').strip()
+                    tool_calls = msg.get('tool_calls', [])
+                    
+                    if tool_calls:
+                        self.log(f"Tool calls: {[tc['function']['name'] for tc in tool_calls]}")
+                        for tc in tool_calls:
+                            result = self._execute_tool(tc)
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tc.get('id', 'call_1'),
+                                "content": result
+                            })
+                        continue  # Loop back with tool results
+                    
+                    # No more tool calls - extract final answer
+                    if not content:
+                        reasoning = msg.get('reasoning_content', '').strip()
+                        if reasoning:
+                            import re
+                            quoted = re.findall(r'"([^"]{15,200})"', reasoning)
+                            if quoted:
+                                content = quoted[-1]
+                            else:
+                                lines = [l.strip() for l in reasoning.split('\n') if l.strip() and len(l.strip()) > 20]
+                                content = lines[-1] if lines else reasoning
+                            for artifact in ['Matches constraints', 'Ready', '✅', 'Conclusion:', 'Answer:']:
+                                content = content.replace(artifact, '')
+                            content = ' '.join(content.split())[:200].strip()
+                    return content
+                    
+            except Exception as e:
+                self.log(f"API error ({url}): {e}")
+                return None
+        
+        return None  # Ran out of tool rounds
 
     def _is_refusal(self, text):
         """Check if the model gave up or refused to answer."""
