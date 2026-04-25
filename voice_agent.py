@@ -9,7 +9,7 @@ Flow:
   (12s silence) → IDLE
 """
 
-import subprocess, os, sys, time, json, wave, struct, threading, math
+import subprocess, os, sys, time, json, wave, struct, threading, math, re
 from pathlib import Path
 from datetime import datetime
 import urllib.request
@@ -370,7 +370,6 @@ class VoiceAgent:
                         with urllib.request.urlopen(req, timeout=15) as resp:
                             content = resp.read().decode('utf-8', errors='ignore')[:1000]
                             # Strip HTML tags
-                            import re
                             content = re.sub(r'<[^>]+>', ' ', content)
                             content = ' '.join(content.split())[:500]
                             return content.strip()
@@ -463,7 +462,6 @@ class VoiceAgent:
                     if not content:
                         reasoning = msg.get('reasoning_content', '').strip()
                         if reasoning:
-                            import re
                             quoted = re.findall(r'"([^"]{15,200})"', reasoning)
                             if quoted:
                                 content = quoted[-1]
