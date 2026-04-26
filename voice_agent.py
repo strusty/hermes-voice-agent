@@ -13,6 +13,7 @@ import subprocess, os, sys, time, json, wave, struct, threading, math, re
 from pathlib import Path
 from datetime import datetime
 import urllib.request
+import urllib.parse
 
 # Tool definitions for the LLM (function calling)
 VOICE_TOOLS = [
@@ -79,12 +80,12 @@ WAKE_WORD = "hermia"
 WAKE_WORD_VARIANTS = ["hermia", "hermiya", "hermiah", "hernia", "permia", "hermia", "hermia"]
 MIC_DEVICE = "plughw:2,0"
 CHUNK_DURATION = 3
-SLIDING_WINDOW = 4  # 12s buffer - wait before firing
-SLIDING_STEP = 2     # transcribe every 6s
+SLIDING_WINDOW = 4  # 12s buffer
+SLIDING_STEP = 3     # transcribe every 9s during idle
 LOG_FILE = Path.home() / ".hermes" / "logs" / "voice-agent.log"
 STATE_FILE = Path.home() / ".hermes" / "voice-agent.state"
 COOLDOWN = 15  # Prevent double-triggering from wake word
-POST_RESPONSE_COOLDOWN = 8  # Don't transcribe for 8s after responding (lets user finish, prevents "thank you Hermia" re-trigger)
+POST_RESPONSE_COOLDOWN = 1  # Brief pause after responding (prevents "thank you Hermia" re-trigger)
 RECORDING_DIR = Path.home() / ".hermes" / "voice-recordings"
 CONV_FILE = Path.home() / ".hermes" / "voice-conversations.log"
 MEMORY_FILE = Path.home() / ".hermes" / "voice-memory.json"
@@ -96,6 +97,7 @@ MEMORY_FILE = Path.home() / ".hermes" / "voice-memory.json"
 MIN_RMS_ENERGY = 0.03
 RMS_GAIN = 6
 MIN_SPEECH_CHUNKS = 1  # Fire on a single spike - "Hermia" is short
+POST_SPEECH_TIMEOUT = 1.5  # Pause after speech before transcribing (lets user finish phrase)
 MAX_MEMORY_TURNS = 10
 
 CONVERSATION_TIMEOUT = 20
@@ -118,6 +120,7 @@ class VoiceAgent:
         self.memory = []
         self.conversation_active = False
         self.last_speech_time = time.time()
+        self.last_speech_chunk_time = 0.0  # When last speech chunk was recorded
         RECORDING_DIR.mkdir(parents=True, exist_ok=True)
 
         self.log(f"Hermes Voice Agent v15 — Whisper '{WHISPER_MODEL_NAME}' ({WHISPER_THREADS} threads, int8) + Tools")
@@ -166,16 +169,18 @@ class VoiceAgent:
         return [
             {
                 "role": "system",
-                "content": f"You are Hermia, a warm AI voice assistant and Stuart's AI companion. "
-                f"You are NOT Shakespeare's character from A Midsummer Night's Dream. "
-                f"Current time: {now}. You are in Atlanta, Georgia. "
-                f"You have these tools. To use one, start your response with TOOL:tool_name on its own line:\n"
-                f"  - TOOL:terminal - Execute a shell command (e.g., df -h, ls, uptime)\n"
-                f"  - TOOL:web_search - Search the web for information (e.g., current Bitcoin price)\n"
-                f"  - TOOL:web_extract - Extract text from a URL\n"
-                f"  - TOOL:send_message - Send a message via Telegram/Discord/WhatsApp\n"
-                f"Keep responses brief (1-2 sentences). Be warm and direct. No markdown. Speak naturally.\n"
-                f"Do NOT start your response with 'Hermia:' or your own name. Just answer directly."
+                "content": (
+                    f"You are Hermia, a warm AI voice assistant. Current time: {now}. Location: Atlanta, Georgia.\n\n"
+                    f"Keep responses brief (1-2 sentences). Speak naturally. No markdown.\n\n"
+                    f"When you need live data, use a tool:\n\n"
+                    f"User: what is the price of Bitcoin?\n"
+                    f"You: TOOL:web_search\ncurrent Bitcoin price\n\n"
+                    f"User: what time is it?\n"
+                    f"You: It is {datetime.now().strftime('%I:%M %p')}.\n\n"
+                    f"User: check disk space\n"
+                    f"You: TOOL:terminal\ndf -h\n\n"
+                    f"Always use the tool directly. Never explain the format."
+                ),
             },
             {
                 "role": "user",
@@ -256,12 +261,11 @@ class VoiceAgent:
                     'beam_size': 5,
                     'word_timestamps': True,
                     # Anti-hallucination parameters:
-                    'vad_filter': True,                        # Built-in Silero VAD pre-filters non-speech
-                    'no_speech_threshold': 0.3,                # More aggressive silence detection (default 0.6)
+                    # NOTE: vad_filter=True cuts off short wake words, so we disable it
+                    # and rely on the post-speech silence timeout instead.
+                    'vad_filter': False,
                     'condition_on_previous_text': False,       # Prevents cascading hallucination loops
                     'temperature': 0,                          # Deterministic decoding, less random hallucination
-                    'compression_ratio_threshold': 2.4,        # Detects repetitive/hallucinated text
-                    'log_prob_threshold': -1.0,               # Filters low-confidence transcriptions
                 }
                 if prompt:
                     kw['initial_prompt'] = prompt
@@ -417,6 +421,7 @@ class VoiceAgent:
                 "messages": messages,
                 "max_tokens": max_tokens,
                 "temperature": 0.8,
+                "reasoning_effort": "disabled",
             }).encode()
             
             try:
@@ -427,8 +432,8 @@ class VoiceAgent:
                     msg = data['choices'][0]['message']
                     content = msg.get('content', '').strip()
                     
-                    # Check for tool usage: TOOL:tool_name on first line
-                    tool_match = re.match(r'^TOOL:(\w+)\s*(.*)', content, re.DOTALL)
+                    # Check for tool usage: TOOL:tool_name anywhere in response
+                    tool_match = re.search(r'(?:^|\n)TOOL:(\w+)\s*(.*)', content, re.DOTALL)
                     if tool_match:
                         tool_name = tool_match.group(1)
                         tool_args_str = tool_match.group(2).strip()
@@ -453,6 +458,7 @@ class VoiceAgent:
                                     tool_args = {'platform': 'telegram', 'message': tool_args_str}
                         
                         result = self._execute_tool({'function': {'name': tool_name, 'arguments': tool_args}})
+                        self.log(f"TOOL RESULT: {result[:200]}")
                         messages.append({
                             "role": "assistant",
                             "content": content
@@ -462,22 +468,25 @@ class VoiceAgent:
                             "content": f"Tool result: {result}\nNow give me your final spoken answer based on this result."
                         })
                         continue  # Loop back with tool results
-                    
-                    # No tool call - extract final answer
-                    if not content:
-                        reasoning = msg.get('reasoning_content', '').strip()
-                        if reasoning:
-                            quoted = re.findall(r'"([^"]{15,200})"', reasoning)
-                            if quoted:
-                                content = quoted[-1]
-                            else:
-                                lines = [l.strip() for l in reasoning.split('\n') if l.strip() and len(l.strip()) > 20]
-                                content = lines[-1] if lines else reasoning
-                            for artifact in ['Matches constraints', 'Ready', '✅', 'Conclusion:', 'Answer:']:
-                                content = content.replace(artifact, '')
-                            content = ' '.join(content.split())[:200].strip()
-                    return content
-                    
+                    # No tool call - extract final answer, stripping reasoning artifacts
+                    answer = content if content else msg.get('reasoning_content', '').strip()
+                    if answer:
+                        # Strip reasoning blocks aggressively
+                        answer = re.sub(r"(?is)Thinking Process:.*?(?=\n\n\d+|\n\n[A-Z])", '', answer)
+                        answer = re.sub(r"(?im)^\d+[.)][^\n]*\n?", '', answer)
+                        answer = re.sub(r"(?im)^(Analyze|Step|Approach)[^\n]*\n?", '', answer)
+                        # Strip reasoning fragments
+                        for phrase in ["I'll use", "Wait,", "Let me think", "Hmm", "Okay", "Alright", "So"]:
+                            answer = re.sub(r"(?i)^" + re.escape(phrase) + r"\s*", '', answer)
+                            answer = re.sub(r"(?i)" + re.escape(phrase) + r"\s*.+$", '', answer)
+                        # Only keep complete sentences
+                        sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', answer) if len(s) > 5]
+                        if sentences:
+                            answer = '. '.join(sentences[:2]).strip()[:200]
+                        else:
+                            answer = ' '.join(answer.split())[:200].strip()
+                    return answer
+                                        
             except Exception as e:
                 self.log(f"API error ({url}): {e}")
                 return None
@@ -485,7 +494,7 @@ class VoiceAgent:
         return None  # Ran out of tool rounds
 
     def _is_refusal(self, text):
-        """Check if the model gave up or refused to answer."""
+        """Check if the model gave up, refused, or just repeated tool instructions."""
         lower = text.lower().strip()
         refusals = [
             "can't assist", "cannot assist", "can't answer", "cannot answer",
@@ -495,7 +504,15 @@ class VoiceAgent:
             "as an ai", "i don't have access",
             "i can't help", "i cannot help",
         ]
-        return any(r in lower for r in refusals) or len(text) < 15
+        # Also catch when model echoes back tool format instructions
+        instruction_echoes = [
+            "start your response with tool",
+            "to use one, start",
+            "you have these tools",
+            "tool:tool_name on its own line",
+            "respond with exactly this format",
+        ]
+        return any(r in lower for r in refusals) or any(e in lower for e in instruction_echoes) or len(text) < 15
 
     FALLBACK_PHRASES = [
         "That's a good question, let me think about that for a moment.",
@@ -591,13 +608,19 @@ class VoiceAgent:
 
                     speech_count = sum(1 for _, x in buf if x > MIN_RMS_ENERGY)
                     if speech_count >= MIN_SPEECH_CHUNKS and len(buf) >= SLIDING_WINDOW:
-                        # During conversation, require louder speech to avoid hallucinating ambient noise
-                        if self.conversation_active:
-                            loud_count = sum(1 for _, x in buf if x > MIN_RMS_ENERGY * 1.5)
-                            if loud_count < 2:
-                                continue  # Probably ambient noise, skip
-                        # Post-response cooldown: don't transcribe immediately after responding
-                        # Prevents "thank you Hermia" from triggering a new wake cycle
+                        # Track when speech last occurred
+                        current_chunk_is_speech = buf[-1][1] > MIN_RMS_ENERGY
+                        if current_chunk_is_speech:
+                            self.last_speech_chunk_time = time.time()
+                            if self.conversation_active:
+                                self.last_speech_time = time.time()  # Keep conversation alive
+
+                        # Wait for silence after speech ends before transcribing
+                        silence_duration = time.time() - self.last_speech_chunk_time
+                        if silence_duration < POST_SPEECH_TIMEOUT:
+                            continue  # User may still be speaking
+
+                        # Post-response cooldown
                         post_cd = time.time() - self.last_response_time
                         if post_cd < POST_RESPONSE_COOLDOWN:
                             continue  # Still cooling down from last response
@@ -621,7 +644,6 @@ class VoiceAgent:
                                             self.log(f"WAKE Command: '{command}'")
                                             self.process_speech(command)
                                         elif self.conversation_active:
-                                            # Wake word during cooldown, but already in conversation — treat as follow-up
                                             self.log(f"CHAT (cooldown) Response to: '{text}'")
                                             self.process_speech(text)
                                         else:
@@ -629,8 +651,11 @@ class VoiceAgent:
                                     elif self.conversation_active:
                                         self.log(f"CHAT Response to: '{text}'")
                                         self.process_speech(text)
+                                    else:
+                                        self.log("No wake word, ignoring")
 
                                 sp.unlink(missing_ok=True)
+                                self.last_speech_chunk_time = 0.0
 
                 time.sleep(0.1)
             except KeyboardInterrupt:

@@ -1,13 +1,18 @@
 [Unit]
-Description=Hermes Voice Agent
-After=network.target
+Description=Hermes Voice Agent - Persistent voice presence
+After=network.target sound.target llama-voice.service
+Requires=llama-voice.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /path/to/voice_agent.py
-Restart=no
 User=sysadmin
-Environment=PYTHONUNBUFFERED=1
+WorkingDirectory=/home/sysadmin
+ExecStartPre=/usr/local/bin/alienware-audio-fix.sh
+EnvironmentFile=/home/sysadmin/.hermes/.env
+ExecStart=/home/sysadmin/.hermes/venv/bin/python3 /home/sysadmin/hermes-voice-agent.py
+Restart=no
+StandardOutput=append:/home/sysadmin/.hermes/logs/voice-agent-stdout.log
+StandardError=append:/home/sysadmin/.hermes/logs/voice-agent-stderr.log
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target
